@@ -274,7 +274,7 @@ def plot_dual_binned_prediction_contour(
     cbar = fig.colorbar(pcm_list[0], cax=cbar_ax, orientation='horizontal')
     cbar.set_label("B1 (nT)")
     plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave space for suptitle
-    plt.savefig(figname, dpi=300)
+    plt.savefig(figname, dpi=300, bbox_inches='tight')
     plt.show()
 
 
@@ -340,6 +340,6 @@ def plot_lat_lon_B1_dualpanel(
     cbar_ax = fig.add_axes([0.25, 0.08, 0.5, 0.02])
     cbar = fig.colorbar(pcm, cax=cbar_ax, orientation='horizontal')
     cbar.set_label("B1 Value")
-    plt.savefig(figname, dpi=300)
+    plt.savefig(figname, dpi=300, bbox_inches='tight')
 
     plt.show()
