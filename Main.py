@@ -89,7 +89,7 @@ test_loader = DataLoader(test_dataset,
 def main():
     
     ############### Gradient Boosting ######################
-    Y_pred_GB = train_gradient_boosting(X_clean, Y_clean)
+    # Y_pred_GB = train_gradient_boosting(X_clean, Y_clean)
     
     ############### MLP Boosting ######################
     V_checkpoint_init = 'Checkpoints/test_init.ckpt'
@@ -171,7 +171,7 @@ def main():
         f.create_dataset('X', data=X_clean)
         f.create_dataset('Y', data=Y_clu)
         f.create_dataset('Y_pred_MLP', data=pred_Y_test.numpy())
-        f.create_dataset('Y_pred_GB', data=Y_pred_GB.numpy())
+        # f.create_dataset('Y_pred_GB', data=Y_pred_GB.numpy())
     
 
 if __name__ == "__main__":

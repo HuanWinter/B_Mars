@@ -1,5 +1,5 @@
 __pycache__/
-Checkpoints/
+# Checkpoints/
 Data/
 lightning_logs/
 Res/

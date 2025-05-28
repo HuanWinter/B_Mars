@@ -1,0 +1,20 @@
+name: mars_ml_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - h5py
+  - ipdb
+  - tqdm
+  - pytorch
+  - pytorch-cuda=12.8  # adjust to your CUDA version if needed
+  - cudatoolkit=12.8   # optional, remove if using CPU only
+  - pip
+  - pip:
+      - lightning
