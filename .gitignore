@@ -1,0 +1,7 @@
+__pycache__/
+Checkpoints/
+Data/
+lightning_logs/
+Res/
+Mars.save
+Main_GB.py
