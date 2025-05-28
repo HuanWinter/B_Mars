@@ -18,7 +18,7 @@ The following files contain useful functions and classes used throughout the not
 
 - [main function](Main.py) : main function, including preprocessing, modeling and plotting.
 - [Functions](funs.py) : Various functions ranging from model training to plotting, including arritectures used for training.
-- [Analysis](Analysis.ipynb) : Analysis the results and plot. 
+- [Analysis](Analysis.ipynb) : Analysis the results and plot (sza vs altitude). 
 
 The notebooks are used to display the outputs.
 
