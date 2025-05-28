@@ -17,11 +17,14 @@ Data_file = 'Data/ML_ready_data.h5'
 save_h5 = 'Res/results.h5'
 figname = 'Figs/sza_vs_alt.png'
 
-Overwrite = False
-train_flag = False
+Overwrite = False # Reprocess the ML-ready data 
+train_flag = False # retrain the MLP model
 # Read or save ML-ready dataset
 if not os.path.exists('Figs/'):
     os.makedirs('Figs/')
+
+if not os.path.exists('Res/'):
+    os.makedirs('Res/')
     
 if ((os.path.exists(Data_file)) & (Overwrite==False)):
     with h5py.File(Data_file, 'r') as f:
