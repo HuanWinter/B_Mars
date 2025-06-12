@@ -9,16 +9,25 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import root_mean_squared_error, r2_score
 
+from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from scipy.stats import binned_statistic_2d
+from scipy.io import readsav
+import h5py
 
+from ipdb import set_trace as st
 
 ########################## Basic function ####################
 
+def to_native(array):
+    """Convert big-endian numpy array to native byte order."""
+    if isinstance(array, np.ndarray) and array.dtype.byteorder == '>':
+        return array.byteswap().view(array.dtype.newbyteorder('='))
+    return array
 
 class ProgressBar_tqdm(TQDMProgressBar):
     def init_validation_tqdm(self):
@@ -56,53 +65,120 @@ def process_inputs_from_sav(data):
     # Reuse previous process_inputs function
     return process_inputs(df)
 
+def ML_dataset(filename, Data_file, stats=None, mode='train'):
+    
+    data = readsav(filename)
+    target = 'mse_b1'
 
-def process_inputs(df):
-    # 1. Circular features → sin and cos
+    # Create a mask for removing test set from the training set        
+    if mode == 'train':
+        
+        # Concatenate into feature matrix X
+        # X = process_inputs_from_sav(data)
+        X, stats = process_inputs(data)
+        Y = np.asarray(data[target])
+        # Y = np.asarray(np.sqrt((np.sum(data[target]**2, axis=1))))
+        print(f"Final shape of X_train: {X.shape}")  # Should be [N, num_total_features]
+        print(f"Final shape of Y_train: {Y.shape}")  # Should be [N, num_total_features]
+        # Define boundaries in Unix time
+        start = datetime(2016, 10, 1, tzinfo=timezone.utc).timestamp()
+        end = datetime(2016, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+        
+        time = data['unixtime']
+        mask_train = (time < start) | (time > end)  # Keep samples outside the specified range
+        X = X[mask_train]
+        Y = Y[mask_train]
+        
+    else:
+        X, _ = process_inputs(data, stats)
+        Y = np.asarray(data[target])
+        # st()
+        print(f"Final shape of X_test: {X.shape}")  # Should be [N, num_total_features]
+        print(f"Final shape of Y_test: {Y.shape}")  # Should be [N, num_total_features]
+
+    # Ensure native byte order
+    X = to_native(X)
+    Y = to_native(Y)
+    
+    # Create a mask for rows without NaNs in X and Y
+    mask = ~np.isnan(X).any(axis=1) & ~np.isnan(Y).any(axis=1)
+
+    # Apply the mask to filter both X and Y
+    X_clean = X[mask]
+    Y_clean = Y[mask]
+    
+    print(f"Clean X shape: {X_clean.shape}")
+    print(f"Clean Y shape: {Y_clean.shape}")
+    
+    with h5py.File(Data_file, 'a') as f:
+        
+        varis = ['X_'+str(mode), 'Y_'+str(mode)]
+        for var in varis:
+            if var in f.keys():
+                del f[var]
+                
+        f.create_dataset('X_'+str(mode), data=X_clean)
+        f.create_dataset('Y_'+str(mode), data=Y_clean)
+    
+    return stats
+        
+def process_inputs(df, stats=None):
+    """
+    Preprocess input DataFrame and return feature matrix X.
+    If `stats` is provided, it uses the given means and stds.
+    Otherwise, computes them and returns for future use.
+    
+    Returns:
+        X: np.ndarray of shape (N, num_features)
+        stats: dict containing mean/std for all normalized variables
+    """
+    import numpy as np
+
     def add_circular(df, col):
         rad = np.deg2rad(df[col])
         return np.sin(rad), np.cos(rad)
-    
+
     for col in ['altitude', 'upstream_nsw', 'f107_mars']:
         df[col] = df[col].astype(np.float64)
 
-    # sin/cos for [0, 360] variables
+    # Sin/cos features
     df['geo_longitude_sin'], df['geo_longitude_cos'] = add_circular(df, 'geo_longitude')
     df['ls_mars_sin'], df['ls_mars_cos'] = add_circular(df, 'ls_mars')
     df['subsolar_lng_sin'], df['subsolar_lng_cos'] = add_circular(df, 'subsolar_lng')
     df['mse_azimuthal_sin'], df['mse_azimuthal_cos'] = add_circular(df, 'mse_azimuthal')
 
-    # 2. Normalize latitude and subsolar_lat from [-90, 90] → [-1, 1]
+    # Latitude-related
     df['geo_latitude_norm'] = df['geo_latitude'] / 90
     df['subsolar_lat_norm'] = df['subsolar_lat'] / 90
-
-    # 3. Cosine of solar zenith angle (if in degrees)
     df['cos_sza'] = np.cos(np.deg2rad(df['mso_sza']))
 
-    # 4. Altitude — normalized (optional: log-scale if necessary)
-    df['altitude_norm'] = (df['altitude'] - df['altitude'].mean()) / df['altitude'].std()
+    # Stack arrays
+    imf_array = np.stack(df['upstream_imf'])
+    df['imf_x'], df['imf_y'], df['imf_z'] = imf_array[:, 0], imf_array[:, 1], imf_array[:, 2]
 
-    # 5. Upstream IMF (Bx, By, Bz) — assume it's an [N, 3] array column
-    imf_array = np.stack(df['upstream_imf'].values)
-    df['imf_x'] = imf_array[:, 0].astype(np.float64)
-    df['imf_y'] = imf_array[:, 1].astype(np.float64)
-    df['imf_z'] = imf_array[:, 2].astype(np.float64)
+    usw_array = np.stack(df['upstream_usw'])
+    df['usw_x'], df['usw_y'], df['usw_z'] = usw_array[:, 0], usw_array[:, 1], usw_array[:, 2]
 
-    # 6. Upstream USW (vx, vy, vz)
-    usw_array = np.stack(df['upstream_usw'].values)
-    df['usw_x'] = usw_array[:, 0].astype(np.float64)
-    df['usw_y'] = usw_array[:, 1].astype(np.float64)
-    df['usw_z'] = usw_array[:, 2].astype(np.float64)
+    # Variables to normalize
+    norm_cols = [
+        'altitude', 'imf_x', 'imf_y', 'imf_z',
+        'usw_x', 'usw_y', 'usw_z',
+        'upstream_nsw', 'f107_mars'
+    ]
 
-    # Normalize each component (z-score)
-    for col in ['imf_x', 'imf_y', 'imf_z', 'usw_x', 'usw_y', 'usw_z']:
-        df[col + '_norm'] = (df[col] - df[col].mean()) / df[col].std()
+    if stats is None:
+        stats = {}
+        for col in norm_cols:
+            mean = df[col].mean()
+            std = df[col].std()
+            stats[col] = {'mean': mean, 'std': std}
+            df[col + '_norm'] = (df[col] - mean) / std
+    else:
+        for col in norm_cols:
+            mean = stats[col]['mean']
+            std = stats[col]['std']
+            df[col + '_norm'] = (df[col] - mean) / std
 
-    # 7. Normalize upstream_nsw and f107_mars
-    df['upstream_nsw_norm'] = (df['upstream_nsw'] - df['upstream_nsw'].mean()) / df['upstream_nsw'].std()
-    df['f107_mars_norm'] = (df['f107_mars'] - df['f107_mars'].mean()) / df['f107_mars'].std()
-
-    # Combine all features into X
     features = [
         'geo_longitude_sin', 'geo_longitude_cos',
         'ls_mars_sin', 'ls_mars_cos',
@@ -114,16 +190,65 @@ def process_inputs(df):
         'usw_x_norm', 'usw_y_norm', 'usw_z_norm',
         'upstream_nsw_norm', 'f107_mars_norm'
     ]
+    array_list = []
+    for feat in features:
+        array_list.append(df[feat])  # should work one-by-one
 
-    X = df[features].to_numpy(dtype=np.float32)
-    return X
+    X = np.stack(array_list, axis=-1)
+
+    return X, stats
 
 
 ########################## ML ####################
 
+class NormalMSELoss(nn.Module):
+    def __init__(self, pdf_interp):
+        super().__init__()
+        self.pdf_interp = pdf_interp
+
+    def forward(self, y_pred, y_true):
+        # y_mag_pred = torch.mean(y_pred**2, dim=1)
+        # y_mag_true = torch.mean(y_true**2, dim=1)
+        # st()
+        with torch.no_grad():
+            y_mag = torch.sqrt(torch.mean(y_true**2, axis=1)).cpu().numpy()
+            weights = 1.0 / (self.pdf_interp(y_mag) + 1e-6)
+            weights = torch.tensor(weights, 
+                                   dtype=torch.float32, 
+                                   device=y_true.device)
+
+        mse = (y_true - y_pred) ** 2
+        weighted_mse = torch.mean(mse * weights, dim=1)
+        return weighted_mse.mean()
+    
+    
+class WeightedMSELoss(nn.Module):
+    def __init__(self, pdf_interp):
+        super().__init__()
+        self.pdf_interp = pdf_interp
+
+    def forward(self, y_pred, y_true):
+        with torch.no_grad():
+            y_mag = torch.sqrt(torch.mean(y_true**2, axis=1)).cpu().numpy()
+            weights = 1.0 / (self.pdf_interp(y_mag) + 1e-6)
+            weights = torch.tensor(weights, 
+                                   dtype=torch.float32, 
+                                   device=y_true.device)
+
+        mse = (y_true - y_pred) ** 2
+        # st()
+        weighted_mse = torch.mean(mse, dim=1) * weights
+        return weighted_mse.mean()
+
 
 class MLPRegressor(LightningModule):
-    def __init__(self, input_dim=16, hidden_dims=[64, 32], lr=1e-3):
+    def __init__(self, 
+                 input_dim=16, 
+                 hidden_dims=[64, 32], 
+                 dropout=0.2,
+                 lr=1e-3, 
+                 weight_decay=1e-4,
+                 pdf_interp=None):
         super().__init__()
         self.save_hyperparameters()
 
@@ -131,12 +256,16 @@ class MLPRegressor(LightningModule):
         in_dim = input_dim
         for h in hidden_dims:
             layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.BatchNorm1d(h))          # normalize features
             layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout))        # regularization
             in_dim = h
-        layers.append(nn.Linear(in_dim, 1))  # Output layer
+        layers.append(nn.Linear(in_dim, 3))  # Output layer
 
         self.model = nn.Sequential(*layers)
-        self.loss_fn = nn.MSELoss()
+        # self.loss_fn = nn.MSELoss()
+        self.loss_fn = WeightedMSELoss(pdf_interp)
+        # self.loss_fn = NormalMSELoss()
 
     def forward(self, x):
         return self.model(x).squeeze(-1)  # Output shape: [batch_size]
@@ -155,7 +284,8 @@ class MLPRegressor(LightningModule):
         self.log("valid_loss", loss)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.RMSprop(self.parameters(), lr=self.hparams.lr)
+        # return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -343,3 +473,42 @@ def plot_lat_lon_B1_dualpanel(
     plt.savefig(figname, dpi=300, bbox_inches='tight')
 
     plt.show()
+    
+
+def plot_prediction_comparison(pred, Y, bins=100, figname=None, title='Prediction vs Ground Truth'):
+    """
+    Plot 2D histogram of predicted vs measured values.
+
+    Parameters:
+        pred (np.ndarray): Predicted values, shape (N,)
+        Y (np.ndarray): Measured values, shape (N,)
+        bins (int): Number of bins for histogram
+        figname (str): Path to save the figure. If None, just displays it.
+        title (str): Title of the plot
+    """
+    if pred.shape != Y.shape:
+        raise ValueError("pred and Y must have the same shape")
+
+    # Remove NaN/inf
+    mask = np.isfinite(pred) & np.isfinite(Y)
+    pred_clean = pred[mask]
+    Y_clean = Y[mask]
+
+    # Plot
+    plt.figure(figsize=(8, 6))
+    plt.plot(Y_clean, 'b.-', label='Observed |B1|')
+    plt.plot(pred_clean, 'y.-', label='predicted |B1|')
+    # plt.colorbar(label='Counts')
+    # plt.plot([Y_clean.min(), Y_clean.max()],
+    #          [Y_clean.min(), Y_clean.max()], 'r--', label='y = x')
+    plt.xlabel('Date')
+    plt.ylabel('|B1| (nT)')
+    plt.title(title)
+    plt.legend()
+
+    if figname:
+        plt.savefig(figname, dpi=300, bbox_inches='tight')
+        # plt.close()
+    # else:
+    plt.show()
+    

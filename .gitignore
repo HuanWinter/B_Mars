@@ -5,3 +5,5 @@ lightning_logs/
 Res/
 Mars.save
 Main_GB.py
+Main_pdf.py
+*.save

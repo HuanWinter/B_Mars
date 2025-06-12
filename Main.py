@@ -1,10 +1,13 @@
 from scipy.io import readsav
+from scipy.interpolate import interp1d
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import os
 import h5py
 from ipdb import set_trace as st
+from datetime import datetime, timezone
 
 from sklearn.model_selection import train_test_split
 from lightning.pytorch import Trainer
@@ -12,10 +15,16 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProg
 
 from funs import * 
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1, 2, 3, 4, 5, 6"
-Data_file = 'Data/ML_ready_data.h5'
-save_h5 = 'Res/results.h5'
-figname = 'Figs/sza_vs_alt.png'
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3, 4, 5, 6, 7"
+train_filename = 'Mars.save'
+valid1_filename = 'mvn_orbits_20161002T0749_20161003T0220.save'
+valid2_filename = 'mvn_orbits_20161204T2209_20161205T1158.save'
+Data_file = 'Data/ML_ready_data_2016_all.h5'
+
+test_clu = ['test1', 'test2']
+# Valid_file = 'Data/ML_ready_data_2016case.h5'
+save_h5 = 'Res/results_2016case.h5'
+figname = 'Figs/sza_vs_alt_2016case.png'
 
 Overwrite = False # Reprocess the ML-ready data 
 train_flag = False # retrain the MLP model
@@ -26,59 +35,67 @@ if not os.path.exists('Figs/'):
 if not os.path.exists('Res/'):
     os.makedirs('Res/')
     
-if ((os.path.exists(Data_file)) & (Overwrite==False)):
-    with h5py.File(Data_file, 'r') as f:
-        X_clean = np.array(f['X'])
-        Y_clean = np.array(f['Y'])
-else:
-    filename = 'Mars.save'
-    data = readsav(filename)
-    target = 'mse_b1'
-
+if ((os.path.exists(Data_file)==0) | (Overwrite==True)):
+    stats = ML_dataset(train_filename, Data_file, mode='train')
+    ML_dataset(valid1_filename, Data_file, stats=stats, mode='test1')
+    ML_dataset(valid2_filename, Data_file, stats=stats, mode='test2')
+        
+with h5py.File(Data_file, 'r') as f:
+    # print(f.keys())
     # st()
-    # Concatenate into feature matrix X
-    X = process_inputs_from_sav(data)
-    Y = np.asarray(np.sqrt((np.sum(data[target]**2, axis=1))))
-    print(f"Final shape of X: {X.shape}")  # Should be [N, num_total_features]
-    print(f"Final shape of Y: {Y.shape}")  # Should be [N, num_total_features]
-
-    # st()
+    X_train = np.array(f['X_train'])
+    Y_train = np.array(f['Y_train'])
     
-    # Create a mask for rows without NaNs in X and Y
-    mask = ~np.isnan(X).any(axis=1) & ~np.isnan(Y)
-
-    # Apply the mask to filter both X and Y
-    X_clean = X[mask]
-    Y_clean = Y[mask]
-
-    print(f"Clean X shape: {X_clean.shape}")
-    print(f"Clean Y shape: {Y_clean.shape}")
-
-    with h5py.File(Data_file, 'w') as f:
-        f.create_dataset('X', data=X_clean)
-        f.create_dataset('Y', data=Y_clean)
-
-# st()
+    X_test = []
+    Y_test = []
+    leng = np.zeros(len(test_clu)) # record the number of index from different events
+    
+    for idx, test_idx in enumerate(test_clu):    
+        X_test.append(np.array(f['X_'+test_idx]))
+        Y_test.append(np.array(f['Y_'+test_idx]))
+        leng[idx] = np.array(f['Y_'+test_idx]).shape[0]
+    
+    X_test = np.concatenate(X_test)
+    Y_test = np.concatenate(Y_test)
+    
+    
+st()
 # Normalization 
 # X_norm, X_mean, X_std = zscore_normalize(X_clean)
 # Y_norm, Y_mean, Y_std = zscore_normalize(Y_clean)
 
 # Convert to torch tensors
-X_tensor = torch.tensor(X_clean, dtype=torch.float32)
-Y_tensor = torch.tensor(Y_clean, dtype=torch.float32)
+X_tensor = torch.tensor(X_train, dtype=torch.float32)
+Y_tensor = torch.tensor(Y_train, dtype=torch.float32)
 
+X_tensor_val = torch.tensor(X_test, dtype=torch.float32)
+Y_tensor_val = torch.tensor(Y_test, dtype=torch.float32)
+'''
+
+X_train, y_train = X_tensor, Y_tensor
+'''
 # Split into train/val
 X_train, X_val, y_train, y_val = train_test_split(X_tensor, 
                                                   Y_tensor, 
                                                   test_size=0.2, 
                                                   random_state=42)
 
+_, X_test, _, y_test = train_test_split(X_tensor_val, 
+                                        Y_tensor_val, 
+                                        test_size=0.99, 
+                                        random_state=42,
+                                        shuffle=False
+                                        )
+
+
 train_dataset = TensorDataset(X_train, y_train)
+# val_dataset = TensorDataset(X_train, y_train)
 val_dataset = TensorDataset(X_val, y_val)
-test_dataset = TensorDataset(X_tensor, Y_tensor)
+test_dataset = TensorDataset(X_test, y_test)
+# test_dataset = TensorDataset(X_test, y_test)
 
 train_loader = DataLoader(train_dataset, 
-                          batch_size=1024, 
+                          batch_size=256, 
                           num_workers=12,
                           shuffle=True)
 val_loader = DataLoader(val_dataset, 
@@ -88,6 +105,18 @@ test_loader = DataLoader(test_dataset,
                         batch_size=1024,
                         num_workers=96)
 
+################################## pdf weighted results
+
+# Compute magnitude
+mag = np.sqrt(np.mean(Y_train**2, axis=1))  # shape: (N, 3)
+
+# Estimate PDF via histogram
+hist, bin_edges = np.histogram(mag, bins=100, density=True)
+bin_centers = 0.5 * (bin_edges[1:] + bin_edges[:-1])
+
+# Convert PDF to weights (inverse PDF for rare emphasis)
+pdf_interp = interp1d(bin_centers, hist, kind='linear', 
+                      bounds_error=False, fill_value='extrapolate')
 
 def main():
     
@@ -103,9 +132,12 @@ def main():
         os.remove(V_checkpoint_name)
         pass
     
+    # st()
+    
     model = MLPRegressor(input_dim=X_tensor.shape[1], 
                          hidden_dims=[128, 64], 
-                         lr=1e-3)
+                         lr=1e-4,
+                         pdf_interp=pdf_interp)
 
     bar = TQDMProgressBar()
     checkpoint_callback = ModelCheckpoint(
@@ -125,7 +157,8 @@ def main():
     trainer = Trainer(
         strategy="ddp",
         accelerator="gpu",
-        devices="auto",
+        devices=8,
+        # devices="auto",
         max_epochs=1000,
         logger=True,
         deterministic=True,
@@ -151,29 +184,21 @@ def main():
     model = model.to('cuda')
     model.eval()
     
-    pred_Y_test = torch.zeros(X_tensor.shape[0])  # Adjust output_dim accordingly
-    Y_clu = torch.zeros(X_tensor.shape[0])
+    # pred_Y_test = torch.zeros(X_val.shape[0])  # Adjust output_dim accordingly
+    # Y_clu = torch.zeros(X_val.shape[0])
     # X_clu = torch.zeros([X_tensor.shape[0], X_tensor.shape[1]])
     
-    with torch.no_grad():
-        offset = 0
-        for batch in tqdm(test_loader):
-            # st()
-            X_batch = batch[0].to('cuda', non_blocking=True)  # Assuming your model is on the 'device' (e.g., 'cuda' or 'cpu')
-            dst_preds = model(X_batch).cpu()
-            B = batch[0].size(0)
-            # st()
-            pred_Y_test[offset:offset+B] = dst_preds
-            Y_clu[offset:offset+B] = batch[1]
-            
-            offset += B
+    pred_Y_test = model(X_tensor_val.to('cuda')).cpu()
         
     with h5py.File(save_h5, 'w') as f:
-        print(X_clean.shape)
+        print(X_tensor_val.shape)
+        print(X_tensor_val.shape)
         print(pred_Y_test.shape)
-        f.create_dataset('X', data=X_clean)
-        f.create_dataset('Y', data=Y_clu)
-        f.create_dataset('Y_pred_MLP', data=pred_Y_test.numpy())
+        f.create_dataset('X', data=X_tensor_val)
+        f.create_dataset('Y', data=Y_tensor_val)
+        f.create_dataset('Y_pred_MLP', data=pred_Y_test.detach().numpy())
+        f.create_dataset('len', data=leng)
+        
         # f.create_dataset('Y_pred_GB', data=Y_pred_GB.numpy())
     
 
