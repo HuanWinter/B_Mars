@@ -15,7 +15,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, TQDMProg
 
 from funs import * 
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3, 4, 5, 6, 7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
 train_filename = 'Mars.save'
 valid1_filename = 'mvn_orbits_20161002T0749_20161003T0220.save'
 valid2_filename = 'mvn_orbits_20161204T2209_20161205T1158.save'
@@ -26,7 +26,8 @@ test_clu = ['test1', 'test2']
 save_h5 = 'Res/results_2016case.h5'
 figname = 'Figs/sza_vs_alt_2016case.png'
 
-Overwrite = False # Reprocess the ML-ready data 
+Overwrite = True # Reprocess the ML-ready data 
+upstream_remove = True 
 train_flag = False # retrain the MLP model
 # Read or save ML-ready dataset
 if not os.path.exists('Figs/'):
@@ -36,9 +37,10 @@ if not os.path.exists('Res/'):
     os.makedirs('Res/')
     
 if ((os.path.exists(Data_file)==0) | (Overwrite==True)):
-    stats = ML_dataset(train_filename, Data_file, mode='train')
-    ML_dataset(valid1_filename, Data_file, stats=stats, mode='test1')
-    ML_dataset(valid2_filename, Data_file, stats=stats, mode='test2')
+    stats = ML_dataset(train_filename, Data_file, mode='train', upstream_flag=upstream_remove)
+    ML_dataset(valid1_filename, Data_file, stats=stats, mode='test1', upstream_flag=upstream_remove)
+    # st()
+    ML_dataset(valid2_filename, Data_file, stats=stats, mode='test2', upstream_flag=upstream_remove)
         
 with h5py.File(Data_file, 'r') as f:
     # print(f.keys())
@@ -46,20 +48,32 @@ with h5py.File(Data_file, 'r') as f:
     X_train = np.array(f['X_train'])
     Y_train = np.array(f['Y_train'])
     
+    Y_diff_train = np.diff(Y_train, axis=0, prepend=Y_train[:1, :])
+
     X_test = []
     Y_test = []
+    Y_diff_test = []
+    Time_test = []
     leng = np.zeros(len(test_clu)) # record the number of index from different events
     
     for idx, test_idx in enumerate(test_clu):    
         X_test.append(np.array(f['X_'+test_idx]))
         Y_test.append(np.array(f['Y_'+test_idx]))
+        Y_diff_test.append(np.diff(np.array(f['Y_'+test_idx]),
+                                   axis=0, prepend=Y_train[:1, :]))
+        
+        Time_test.append(np.array(f['Time_'+test_idx]))
         leng[idx] = np.array(f['Y_'+test_idx]).shape[0]
     
     X_test = np.concatenate(X_test)
     Y_test = np.concatenate(Y_test)
+    Y_diff_test = np.concatenate(Y_diff_test)
+    Time_test = np.concatenate(Time_test)
     
-    
-st()
+
+# Y_train = np.hstack((Y_train, Y_diff_train))
+# Y_test = np.hstack((Y_test, Y_diff_test))
+# st()
 # Normalization 
 # X_norm, X_mean, X_std = zscore_normalize(X_clean)
 # Y_norm, Y_mean, Y_std = zscore_normalize(Y_clean)
@@ -78,16 +92,20 @@ X_train, y_train = X_tensor, Y_tensor
 X_train, X_val, y_train, y_val = train_test_split(X_tensor, 
                                                   Y_tensor, 
                                                   test_size=0.2, 
-                                                  random_state=42)
+                                                  random_state=42,
+                                                  shuffle=True
+                                                  )
 
-_, X_test, _, y_test = train_test_split(X_tensor_val, 
-                                        Y_tensor_val, 
-                                        test_size=0.99, 
-                                        random_state=42,
-                                        shuffle=False
-                                        )
+# _, X_test, _, y_test = train_test_split(X_tensor_val,
+#                                         Y_tensor_val,
+#                                         test_size=0.99, # Test set is 100% of the data
+#                                         train_size=0.01, # Train set is 0%
+#                                         shuffle=False
+#                                         )
 
+X_test, y_test = X_tensor_val, Y_tensor_val
 
+# st()
 train_dataset = TensorDataset(X_train, y_train)
 # val_dataset = TensorDataset(X_train, y_train)
 val_dataset = TensorDataset(X_val, y_val)
@@ -125,7 +143,8 @@ def main():
     
     ############### MLP Boosting ######################
     V_checkpoint_init = 'Checkpoints/test_init.ckpt'
-    V_checkpoint_name = 'Checkpoints/test.ckpt'
+    # V_checkpoint_name = 'Checkpoints/test.ckpt'
+    V_checkpoint_name = 'Checkpoints/test_without_upstream.ckpt'
     checkpoint_dir = 'Checkpoints/'
     if ((os.path.exists(V_checkpoint_name)) & (train_flag)):
         # st()
@@ -151,13 +170,13 @@ def main():
 
     early_stopping_callback = EarlyStopping(
         monitor='valid_loss',
-        patience=20
+        patience=10
     )
 
     trainer = Trainer(
         strategy="ddp",
         accelerator="gpu",
-        devices=8,
+        devices=4,
         # devices="auto",
         max_epochs=1000,
         logger=True,
@@ -189,15 +208,16 @@ def main():
     # X_clu = torch.zeros([X_tensor.shape[0], X_tensor.shape[1]])
     
     pred_Y_test = model(X_tensor_val.to('cuda')).cpu()
-        
+
     with h5py.File(save_h5, 'w') as f:
         print(X_tensor_val.shape)
         print(X_tensor_val.shape)
         print(pred_Y_test.shape)
         f.create_dataset('X', data=X_tensor_val)
-        f.create_dataset('Y', data=Y_tensor_val)
-        f.create_dataset('Y_pred_MLP', data=pred_Y_test.detach().numpy())
+        f.create_dataset('Y', data=Y_tensor_val[:, :3])
+        f.create_dataset('Y_pred_MLP', data=pred_Y_test[:, :3].detach().numpy())
         f.create_dataset('len', data=leng)
+        f.create_dataset('Time', data=Time_test)
         
         # f.create_dataset('Y_pred_GB', data=Y_pred_GB.numpy())
     

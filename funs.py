@@ -17,12 +17,110 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from scipy.stats import binned_statistic_2d
 from scipy.io import readsav
+from scipy.signal import butter, filtfilt
+
 import h5py
+from typing import Dict, Any
 
 from ipdb import set_trace as st
 
 ########################## Basic function ####################
 
+def remove_nan_rows_from_dict(data_dict: Dict[str, Any], count_key: str = 'npt') -> Dict[str, Any]:
+    """
+    Removes rows containing NaN values from a dictionary of synchronized NumPy arrays.
+
+    This function iterates through all NumPy arrays in the input dictionary that
+    have a length specified by `data_dict[count_key]`. It creates a master mask
+    to identify every row index that contains a NaN in any of these arrays.
+    It then returns a new dictionary where all corresponding arrays have been
+    sliced to remove these rows, and the count value is updated.
+
+    Args:
+        data_dict (Dict[str, Any]): The input dictionary containing NumPy arrays and other data.
+                                   It's expected that all arrays to be cleaned share the
+                                   same first dimension length.
+        count_key (str): The key in `data_dict` that holds the integer count of
+                         rows/data points (e.g., 'npt').
+
+    Returns:
+        Dict[str, Any]: A new dictionary with NaN-containing rows removed from all
+                        relevant arrays and the count key updated.
+
+    Raises:
+        ValueError: If the `count_key` is not found in the dictionary.
+    """
+    if count_key not in data_dict:
+        raise ValueError(f"Error: The specified count_key '{count_key}' was not found in the dictionary.")
+
+    n_points = data_dict[count_key]
+
+    # Initialize a mask to mark every row that contains a NaN.
+    # We start with all False (assuming all rows are good).
+    combined_nan_mask = np.zeros(n_points, dtype=bool)
+
+    # Iterate through all items to build the master NaN mask
+    for key, value in data_dict.items():
+        # Process only NumPy arrays that are part of the main dataset
+        if isinstance(value, np.ndarray) and value.shape[0] == n_points:
+            # For 2D+ arrays, check for NaNs across the columns (axis=1)
+            if value.ndim > 1:
+                current_mask = np.isnan(value).any(axis=1)
+            # For 1D arrays
+            else:
+                current_mask = np.isnan(value)
+
+            # Update the combined mask using a logical OR.
+            # A row is marked bad (True) if it was already bad OR if it's bad in the current array.
+            np.logical_or(combined_nan_mask, current_mask, out=combined_nan_mask)
+
+    # Invert the mask to get all rows that are GOOD (do not have NaNs)
+    good_indices_mask = ~combined_nan_mask
+    new_n_points = good_indices_mask.sum()
+
+    print(f"Original number of points: {n_points}")
+    print(f"Number of rows with NaNs to be removed: {n_points - new_n_points}")
+    print(f"New number of points after cleaning: {new_n_points}")
+
+    # Build the new, cleaned dictionary
+    cleaned_dict = {}
+    for key, value in data_dict.items():
+        if key == count_key:
+            cleaned_dict[key] = new_n_points
+        elif isinstance(value, np.ndarray) and value.shape[0] == n_points:
+            # Slice the array to keep only the good rows
+            cleaned_dict[key] = value[good_indices_mask]
+        else:
+            # Copy any other metadata that should not be sliced
+            cleaned_dict[key] = value
+            
+    return cleaned_dict
+
+
+def butterfilter(data,
+                 cutoff=5,
+                 order=4,
+                 fs=100
+                 ):
+    
+    # Design the low-pass filter
+    # cutoff: Cutoff frequency in Hz
+    # order: Filter order
+    # fs: Sampling frequency in Hz
+
+    # Get filter coefficients
+    b, a = butter(order, cutoff, 
+                    btype='low', 
+                    analog=False, 
+                    fs=fs
+                    )
+
+    # 3. Apply the filter to each dimension
+    Y_filtered = filtfilt(b, a, data, axis=0)
+    
+    return Y_filtered
+
+        
 def to_native(array):
     """Convert big-endian numpy array to native byte order."""
     if isinstance(array, np.ndarray) and array.dtype.byteorder == '>':
@@ -65,33 +163,91 @@ def process_inputs_from_sav(data):
     # Reuse previous process_inputs function
     return process_inputs(df)
 
-def ML_dataset(filename, Data_file, stats=None, mode='train'):
+def ML_dataset(filename, Data_file, stats=None, mode='train', upstream_flag=False):
     
     data = readsav(filename)
     target = 'mse_b1'
+    boundary = 'vignes_empirical_boundaries.save'
+    
+    # st()
+    # --- 2. Call the function to clean the data ---
+    print("--- Starting Cleaning Process ---")
+    cleaned_data = remove_nan_rows_from_dict(data, count_key='npt')
+    print("--- Cleaning Complete --- \n")
 
     # Create a mask for removing test set from the training set        
     if mode == 'train':
         
         # Concatenate into feature matrix X
         # X = process_inputs_from_sav(data)
-        X, stats = process_inputs(data)
-        Y = np.asarray(data[target])
+        # st()
+        
+        X, stats, df = process_inputs(cleaned_data)
+        Y = np.asarray(cleaned_data[target])
+        
+        # apply low-pass filter
+        Y = butterfilter(Y)
+        
+        # st()
+        # add the variation of mse_b1 as the weights during training
+        Y_diff = np.diff(Y, axis=0, prepend=Y[:1, :])
+        Y = np.hstack((Y, Y_diff))
+        
         # Y = np.asarray(np.sqrt((np.sum(data[target]**2, axis=1))))
-        print(f"Final shape of X_train: {X.shape}")  # Should be [N, num_total_features]
-        print(f"Final shape of Y_train: {Y.shape}")  # Should be [N, num_total_features]
+        print(f"Initial shape of X_train: {X.shape}")  # Should be [N, num_total_features]
+        print(f"Initial shape of Y_train: {Y.shape}")  # Should be [N, num_total_features]
+        
+        # print(f"Final shape of Y_smooth: {Y_filtered.shape}")  # Should be [N, num_total_features]
+        # st()
         # Define boundaries in Unix time
         start = datetime(2016, 10, 1, tzinfo=timezone.utc).timestamp()
         end = datetime(2016, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp()
         
-        time = data['unixtime']
+        # st()
+        # remove test set from the training
+        time = cleaned_data['unixtime']
         mask_train = (time < start) | (time > end)  # Keep samples outside the specified range
         X = X[mask_train]
         Y = Y[mask_train]
+        time = time[mask_train]
+        
+        print(f"Initial train shape of X_train: {X.shape}")  # Should be [N, num_total_features]
+        print(f"Initial train shape of Y_train: {Y.shape}")  # Should be [N, num_total_features]
+        
+        if upstream_flag:
+            ############################### remove upstream data  
+            boundary_data = readsav(boundary)
+            idx_sel = find_indices_below_mpb(df, boundary_data, mask_train)
+            
+            X = X[idx_sel]
+            Y = Y[idx_sel]
+            time = time[idx_sel]
+        
+        # Y = np.asarray(np.sqrt((np.sum(data[target]**2, axis=1))))
+        print(f"Final nonupstream shape of X_train: {X.shape}")  # Should be [N, num_total_features]
+        print(f"Final nonupstream shape of Y_train: {Y.shape}")  # Should be [N, num_total_features]
         
     else:
-        X, _ = process_inputs(data, stats)
-        Y = np.asarray(data[target])
+        X, _, df = process_inputs(cleaned_data, stats)
+        Y = np.asarray(cleaned_data[target])
+        Y = butterfilter(Y)
+        
+        # add the variation of mse_b1 as the weights during training
+        Y_diff = np.diff(Y, axis=0, prepend=Y[:1, :])
+        Y = np.hstack((Y, Y_diff))
+        
+        time = cleaned_data['unixtime']
+        
+        if upstream_flag:
+            
+            ############################### remove upstream data  
+            boundary_data = readsav(boundary)
+            idx_sel = find_indices_below_mpb(df, boundary_data, np.ones(X.shape[0]).astype(bool))
+            
+            X = X[idx_sel]
+            Y = Y[idx_sel]
+            time = time[idx_sel]
+        
         # st()
         print(f"Final shape of X_test: {X.shape}")  # Should be [N, num_total_features]
         print(f"Final shape of Y_test: {Y.shape}")  # Should be [N, num_total_features]
@@ -100,28 +256,40 @@ def ML_dataset(filename, Data_file, stats=None, mode='train'):
     X = to_native(X)
     Y = to_native(Y)
     
+    # st()
+    
     # Create a mask for rows without NaNs in X and Y
     mask = ~np.isnan(X).any(axis=1) & ~np.isnan(Y).any(axis=1)
 
     # Apply the mask to filter both X and Y
     X_clean = X[mask]
     Y_clean = Y[mask]
+    Time_clean = time[mask]
     
     print(f"Clean X shape: {X_clean.shape}")
     print(f"Clean Y shape: {Y_clean.shape}")
+    print(f"Clean Time shape: {Time_clean.shape}")
+    # print(f"Clean Y shape: {Y_clean.shape}")
     
     with h5py.File(Data_file, 'a') as f:
         
-        varis = ['X_'+str(mode), 'Y_'+str(mode)]
+        varis = ['X_'+str(mode), 'Y_'+str(mode), 'Time_'+str(mode)]
         for var in varis:
             if var in f.keys():
                 del f[var]
                 
         f.create_dataset('X_'+str(mode), data=X_clean)
         f.create_dataset('Y_'+str(mode), data=Y_clean)
+        f.create_dataset('Time_'+str(mode), data=Time_clean)
     
     return stats
-        
+       
+
+def add_circular(df, col):
+    rad = np.deg2rad(df[col])
+    return np.sin(rad), np.cos(rad)
+
+     
 def process_inputs(df, stats=None):
     """
     Preprocess input DataFrame and return feature matrix X.
@@ -132,11 +300,6 @@ def process_inputs(df, stats=None):
         X: np.ndarray of shape (N, num_features)
         stats: dict containing mean/std for all normalized variables
     """
-    import numpy as np
-
-    def add_circular(df, col):
-        rad = np.deg2rad(df[col])
-        return np.sin(rad), np.cos(rad)
 
     for col in ['altitude', 'upstream_nsw', 'f107_mars']:
         df[col] = df[col].astype(np.float64)
@@ -192,33 +355,114 @@ def process_inputs(df, stats=None):
     ]
     array_list = []
     for feat in features:
-        array_list.append(df[feat])  # should work one-by-one
+        array_list.append(df[feat])  # should work one-by-one-
 
     X = np.stack(array_list, axis=-1)
 
-    return X, stats
+    return X, stats, df
+
+
+def find_indices_below_mpb(data_dict: Dict[str, np.ndarray], 
+                           model_data: Dict[str, Any],
+                           mask) -> np.ndarray:
+    """
+    Identifies array indices for samples below the Mars MPB from a dictionary.
+
+    This function takes a dictionary of NumPy arrays and a pre-loaded empirical model. It
+    interpolates the Magnetic Pileup Boundary (MPB) altitude for each sample's
+    Solar Zenith Angle (SZA) and returns the indices of samples whose
+    altitude is below this boundary.
+
+    Args:
+        data_dict (Dict[str, np.ndarray]): Input dictionary of NumPy arrays. Must contain
+                                           the keys 'altitude' (in km) and 'sza' (in degrees).
+                                           All arrays should have the same length.
+        model_data (Dict[str, Any]): A dictionary containing the boundary model,
+                                     with keys 'sza_grid' and 'alt_mpb'.
+
+    Returns:
+        np.ndarray: A 1D NumPy array of integer indices from the original
+                    arrays that correspond to samples below the MPB.
+
+    Raises:
+        KeyError: If the data_dict is missing 'altitude' or 'sza' keys,
+                  or if the model_data is missing 'sza_grid' or 'alt_mpb'.
+    """
+    # --- 1. Validate inputs ---
+    required_data_keys = ['altitude', 'cos_sza']
+    if not all(key in data_dict for key in required_data_keys):
+        raise KeyError(f"Input dictionary must contain the keys: {required_data_keys}")
+
+    required_model_keys = ['sza_grid', 'alt_mpb']
+    if not all(key in model_data for key in required_model_keys):
+        raise KeyError(f"Model data dictionary must contain the keys: {required_model_keys}")
+
+    altitude = data_dict['altitude'][mask]
+    sza = np.rad2deg(np.arccos(data_dict['cos_sza'].flatten()))[mask]
+    sza_grid = model_data['sza_grid']
+    alt_mpb = model_data['alt_mpb']
+
+    # --- 2. Interpolate the MPB altitude for each data point ---
+    # For each 'sza' value in the dictionary, find the corresponding
+    # boundary altitude from the model's grid using linear interpolation.
+    mpb_altitude_at_sza = np.interp(sza, sza_grid, alt_mpb)
+
+    # --- 3. Identify points below the boundary ---
+    # This creates a boolean array (True for samples below the MPB)
+    is_below_mpb = altitude < mpb_altitude_at_sza
+
+    # --- 4. Get and return the indices ---
+    # np.where returns the indices where the condition is True.
+    # The [0] is necessary because np.where returns a tuple of arrays.
+    below_mpb_indices = np.where(is_below_mpb)[0]
+
+    return below_mpb_indices
 
 
 ########################## ML ####################
 
 class NormalMSELoss(nn.Module):
-    def __init__(self, pdf_interp):
+    def __init__(self):
         super().__init__()
-        self.pdf_interp = pdf_interp
+        # self.pdf_interp = pdf_interp
 
     def forward(self, y_pred, y_true):
-        # y_mag_pred = torch.mean(y_pred**2, dim=1)
-        # y_mag_true = torch.mean(y_true**2, dim=1)
-        # st()
-        with torch.no_grad():
-            y_mag = torch.sqrt(torch.mean(y_true**2, axis=1)).cpu().numpy()
-            weights = 1.0 / (self.pdf_interp(y_mag) + 1e-6)
-            weights = torch.tensor(weights, 
-                                   dtype=torch.float32, 
-                                   device=y_true.device)
 
         mse = (y_true - y_pred) ** 2
-        weighted_mse = torch.mean(mse * weights, dim=1)
+        weighted_mse = torch.mean(mse, dim=1)
+        return weighted_mse.mean()
+    
+
+class Mag_Diffweight_MSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # self.pdf_interp = pdf_interp
+
+    def forward(self, y_pred, y_true):
+        
+        # st()
+        y_real = y_true[:, :3]         
+        y_prev = (y_true[:, :3] - y_true[:, 3:])
+        
+        weights = torch.abs(torch.mean(y_real**2, dim=1) - torch.mean(y_prev**2, dim=1))
+        mse = torch.abs(torch.mean(y_real**2, dim=1) - torch.mean(y_pred**2, dim=1))
+        
+        weighted_mse = torch.mean(mse*weights)
+        return weighted_mse
+    
+    
+class Diffweight_MSELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # self.pdf_interp = pdf_interp
+
+    def forward(self, y_pred, y_true):
+        
+        y_diff = y_true[:, 3:]
+        y_real = y_true[:, :3]
+        weights = torch.mean(y_diff**2, axis=1)
+        mse = (y_real - y_pred) ** 2
+        weighted_mse = torch.mean(mse*weights, dim=1)
         return weighted_mse.mean()
     
     
@@ -245,7 +489,7 @@ class MLPRegressor(LightningModule):
     def __init__(self, 
                  input_dim=16, 
                  hidden_dims=[64, 32], 
-                 dropout=0.2,
+                 dropout=0.0,
                  lr=1e-3, 
                  weight_decay=1e-4,
                  pdf_interp=None):
@@ -264,8 +508,10 @@ class MLPRegressor(LightningModule):
 
         self.model = nn.Sequential(*layers)
         # self.loss_fn = nn.MSELoss()
-        self.loss_fn = WeightedMSELoss(pdf_interp)
+        # self.loss_fn = WeightedMSELoss(pdf_interp)
         # self.loss_fn = NormalMSELoss()
+        # self.loss_fn = Diffweight_MSELoss()
+        self.loss_fn = Mag_Diffweight_MSELoss()
 
     def forward(self, x):
         return self.model(x).squeeze(-1)  # Output shape: [batch_size]
@@ -284,8 +530,8 @@ class MLPRegressor(LightningModule):
         self.log("valid_loss", loss)
 
     def configure_optimizers(self):
-        return torch.optim.RMSprop(self.parameters(), lr=self.hparams.lr)
-        # return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        # return torch.optim.RMSprop(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
     
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -496,8 +742,8 @@ def plot_prediction_comparison(pred, Y, bins=100, figname=None, title='Predictio
 
     # Plot
     plt.figure(figsize=(8, 6))
-    plt.plot(Y_clean, 'b.-', label='Observed |B1|')
-    plt.plot(pred_clean, 'y.-', label='predicted |B1|')
+    plt.plot(Y_clean, 'b.', label='Observed |B1|')
+    plt.plot(pred_clean, 'y.', label='predicted |B1|')
     # plt.colorbar(label='Counts')
     # plt.plot([Y_clean.min(), Y_clean.max()],
     #          [Y_clean.min(), Y_clean.max()], 'r--', label='y = x')
